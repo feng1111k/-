@@ -1,0 +1,6 @@
+﻿Python: D:\develve\python\python.exe 3.14.8 (tags/v3.14.8:8e6e75d, Sep 30 2026, 18:19:33) [MSC v.1944 64 bit (AMD64)]
+[OK] cv2 5.0.0
+[OK] mss 10.2.0
+[OK] numpy 2.5.4
+[OK] torch 2.14.1+cpu
+[OK] ultralytics 8.4.177

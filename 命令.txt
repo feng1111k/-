@@ -1,0 +1,8 @@
+先安装python环境
+
+安装依赖：pip install mss ultralytics opencv-python
+
+在这个文件夹打开cmd
+命令：python main_opencv.py
+
+在项目文件夹里执行这一句，会自动重建 build\ 和 dist\：python -m PyInstaller --noconfirm --clean ScreenPersonMonitor.spec
