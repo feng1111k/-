@@ -12,8 +12,6 @@
 关键点:
   - 两个区域分开选择, 检测用监控区域, 保存用截图区域
   - 全屏覆盖层用 tkinter 实现, 坐标 = 物理像素, 与 mss 抓屏坐标 1:1 对应
-  - 强制进程 DPI 感知(每显示器 v2), 125%/150% 缩放下坐标也不会偏移
-  - 全程写日志到 <保存目录>\\monitor_log.txt, 出问题时可以直接看日志
 
 命令行:
   python main_opencv.py                        正常使用
@@ -123,6 +121,142 @@ CONF_THRESHOLD = 0.45   # person 置信度阈值
 COOLDOWN = 5.0          # 两次截图最小间隔(秒)
 MIN_SIDE = 20           # 区域最小边长
 
+# 预览窗状态条最大高度 (像素)。单行紧凑设计, 尽量少遮挡监控画面。
+BAR_H = 34
+
+
+# ------------------------------------------------- 中文字体与文本绘制
+# OpenCV 自带的 Hershey 字体画不了中文(会变成问号), 所以用系统的
+# 微软雅黑等字体文件 + PIL 渲染中文。PIL 不可用时自动退回英文。
+_FONT_CACHE = {}
+_PIL_OK = None
+
+
+def _find_cn_font(bold=False):
+    """找一个可用的中文字体文件"""
+    import glob
+    names = ([r'C:\Windows\Fonts\msyhbd.ttc', r'C:\Windows\Fonts\msyhbd.ttf',
+              r'C:\Windows\Fonts\simhei.ttf'] if bold else
+             [r'C:\Windows\Fonts\msyh.ttc', r'C:\Windows\Fonts\msyh.ttf',
+              r'C:\Windows\Fonts\simhei.ttf', r'C:\Windows\Fonts\simsun.ttc'])
+    for p in names:
+        if os.path.exists(p):
+            return p
+    for pat in ('msyh*.tt*', 'simhei.ttf', 'Deng.ttf', 'simsun.ttc'):
+        hits = glob.glob(os.path.join(r'C:\Windows\Fonts', pat))
+        if hits:
+            return hits[0]
+    return None
+
+
+def _get_font(size, bold=False):
+    key = (int(size), bold)
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
+    font = None
+    try:
+        from PIL import ImageFont
+        path = _find_cn_font(bold)
+        if path:
+            font = ImageFont.truetype(path, int(size))
+    except Exception:
+        font = None
+    _FONT_CACHE[key] = font
+    return font
+
+
+def _pil_available():
+    global _PIL_OK
+    if _PIL_OK is None:
+        try:
+            from PIL import Image, ImageDraw      # noqa: F401
+            _PIL_OK = _get_font(20) is not None
+        except Exception:
+            _PIL_OK = False
+    return _PIL_OK
+
+
+def draw_text(img, text, org, size=28, color=(0, 255, 0), bold=False, shadow=True):
+    """
+    在 OpenCV 图像上写字。有中文字体时用 PIL(支持中文), 否则退回 cv2.putText(英文)。
+    org 是文字左上角坐标。
+    """
+    if not text:
+        return
+    if not _pil_available():
+        cv2.putText(img, text, (org[0], org[1] + size), cv2.FONT_HERSHEY_SIMPLEX,
+                    size / 32.0, color, max(1, int(size / 14)))
+        return
+    try:
+        from PIL import Image, ImageDraw
+        font = _get_font(size, bold)
+        # 先量出文字大小(含描边余量)
+        box = font.getbbox(text)
+        tw = box[2] - box[0]
+        th = box[3] - box[1]
+        pad = 4
+        w, h = tw + pad * 2, th + pad * 2
+        if w <= 0 or h <= 0:
+            return
+        tile = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(tile)
+        # 黑色描边让文字在任何背景上都清晰
+        for dx, dy in ((-2, 0), (2, 0), (0, -2), (0, 2), (-1, -1), (1, -1), (-1, 1), (1, 1)):
+            d.text((pad - box[0] + dx, pad - box[1] + dy), text, font=font,
+                   fill=(0, 0, 0, 255))
+        d.text((pad - box[0], pad - box[1]), text, font=font, fill=tuple(color) + (255,))
+        tile = np.array(tile)
+        rgb, alpha = tile[:, :, :3], tile[:, :, 3:4].astype(np.float32) / 255.0
+        x, y = int(org[0]), int(org[1])
+        H, W = img.shape[:2]
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(W, x + w), min(H, y + h)
+        if x1 <= x0 or y1 <= y0:
+            return
+        sx0, sy0 = x0 - x, y0 - y
+        sub = img[y0:y1, x0:x1].astype(np.float32)
+        patch_rgb = rgb[sy0:sy0 + (y1 - y0), sx0:sx0 + (x1 - x0)].astype(np.float32)
+        a = alpha[sy0:sy0 + (y1 - y0), sx0:sx0 + (x1 - x0)]
+        img[y0:y1, x0:x1] = (sub * (1.0 - a) + patch_rgb * a).astype(np.uint8)
+    except Exception:
+        # 任何意外都退回英文, 保证不影响主流程
+        cv2.putText(img, text, (org[0], org[1] + size), cv2.FONT_HERSHEY_SIMPLEX,
+                    size / 32.0, color, max(1, int(size / 14)))
+
+
+
+# ------------------------------------------------- 锁屏 / 安全桌面检测
+# 按 Win+L 锁屏后, Windows 会切到 Winlogon 安全桌面, 此时 BitBlt 会返回
+# "拒绝访问", 抓不到任何画面。这是系统的安全设计, 普通程序无法绕过。
+# 这里做两件事: 1) 识别出"被锁屏"而不是"抓屏坏了"  2) 锁屏期间优雅等待
+def is_desktop_locked():
+    """
+    尝试打开当前输入桌面。正常解锁时能打开 Default 桌面;
+    锁屏时会失败(输入桌面已切到 Winlogon, 普通权限打不开)。
+    返回 (是否锁定, 说明)
+    """
+    try:
+        user32 = ctypes.windll.user32
+        h = user32.OpenInputDesktop(0, False, 0x0001)   # DESKTOP_READOBJECTS
+        if not h:
+            return True, "无法打开输入桌面(已锁屏或切到安全桌面)"
+        try:
+            need = ctypes.c_ulong(0)
+            # UOI_NAME = 2
+            if user32.GetUserObjectInformationW(h, 2, None, 0, ctypes.byref(need)) or need.value:
+                buf = ctypes.create_unicode_buffer(need.value // 2 + 2)
+                if user32.GetUserObjectInformationW(h, 2, buf, need.value, ctypes.byref(need)):
+                    name = buf.value
+                    if name.lower() != 'default':
+                        return True, "当前输入桌面=%s" % name
+                    return False, "输入桌面=Default"
+            return False, "输入桌面可打开"
+        finally:
+            user32.CloseDesktop(h)
+    except Exception as exc:
+        return False, "检测异常: %r" % (exc,)
+
+
 
 # ---------------------------------------------------------------- 路径工具
 def resource_path(rel):
@@ -142,32 +276,16 @@ MODEL_PATH = resource_path('yolov8n.pt')
 
 # ---------------------------------------------------------------- 日志
 class Log:
-    """同时写控制台和 <保存目录>\\monitor_log.txt, 方便排查问题"""
-
-    def __init__(self):
-        self.path = None
-        self._lock = threading.Lock()
-
-    def bind(self, directory):
-        try:
-            os.makedirs(directory, exist_ok=True)
-            self.path = os.path.join(directory, 'monitor_log.txt')
-        except Exception:
-            self.path = os.path.join(os.environ.get('TEMP', '.'), 'monitor_log.txt')
+    """
+    只往控制台输出, 不写任何文件。
+    打包成 exe(无控制台)时这些输出自动丢弃, 不会在保存目录里留文件。
+    """
 
     def __call__(self, msg):
-        line = "[%s] %s" % (time.strftime('%Y-%m-%d %H:%M:%S'), msg)
-        with self._lock:
-            try:
-                print(line)
-            except Exception:
-                pass
-            if self.path:
-                try:
-                    with open(self.path, 'a', encoding='utf-8') as f:
-                        f.write(line + "\n")
-                except Exception:
-                    pass
+        try:
+            print("[%s] %s" % (time.strftime('%Y-%m-%d %H:%M:%S'), msg))
+        except Exception:
+            pass
 
 
 log = Log()
@@ -409,18 +527,38 @@ def main():
             print(">=阈值(%.2f)的人数: %d" % (CONF_THRESHOLD, len(hits)))
         return
 
+    locktest_dir = None
+    if '--locktest' in argv:
+        i = argv.index('--locktest')
+        locktest_dir = argv[i + 1] if len(argv) > i + 1 else os.path.join(app_dir(), 'screenshots')
+
     if '--selftest' in argv:
         i = argv.index('--selftest')
         selftest_dir = argv[i + 1] if len(argv) > i + 1 else os.path.join(app_dir(), 'screenshots')
 
-    if selftest_dir:
+    if locktest_dir:
+        # 锁屏测试: 监视全屏 120 秒, 期间用户可以按 Win+L 锁屏再解锁
+        save_dir = locktest_dir
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+        except Exception:
+            save_dir = os.path.join(os.environ.get('TEMP', '.'), 'spm_locktest')
+            os.makedirs(save_dir, exist_ok=True)
+        log("=== 锁屏测试模式 (监视全屏 120 秒, 请按 Win+L 锁屏 20 秒再解锁) ===")
+        info = screen_info()
+        log("DPI: %s" % info['dpi_msg'])
+        log("屏幕: tkinter=%s  mss=%s" % (info['tk_screen'], info['mss_screen']))
+        with mss() as sct:
+            m = sct.monitors[0]
+            shot_roi = (m['left'], m['top'], m['width'], m['height'])
+        mon_roi = shot_roi
+    elif selftest_dir:
         save_dir = selftest_dir
         try:
             os.makedirs(save_dir, exist_ok=True)
         except Exception:
             save_dir = os.path.join(os.environ.get('TEMP', '.'), 'spm_selftest')
             os.makedirs(save_dir, exist_ok=True)
-        log.bind(save_dir)
         log("=== 自检模式 (跳过框选, 监视整个屏幕 30 秒) ===")
         info = screen_info()
         log("DPI: %s" % info['dpi_msg'])
@@ -432,7 +570,6 @@ def main():
     else:
         # ---- 步骤 1: 保存文件夹 ----
         save_dir = choose_save_dir()
-        log.bind(save_dir)
         log("=== 启动 ===")
         info = screen_info()
         log("DPI: %s" % info['dpi_msg'])
@@ -462,6 +599,13 @@ def main():
             _abort("已取消选择【监控区域】, 程序退出。")
         log("监控区域 (left,top,w,h) = %s" % (mon_roi,))
 
+    # 调试图(首帧/锁屏证据)统一放到系统临时目录, 不污染用户的保存文件夹
+    debug_dir = os.path.join(os.environ.get('TEMP', '.'), 'ScreenPersonMonitor_debug')
+    try:
+        os.makedirs(debug_dir, exist_ok=True)
+    except Exception:
+        debug_dir = os.environ.get('TEMP', '.')
+
     # ---- 加载模型 ----
     log("正在加载 YOLO 模型: %s" % MODEL_PATH)
     log("模型文件存在: %s" % os.path.exists(MODEL_PATH))
@@ -470,7 +614,7 @@ def main():
     except Exception as exc:
         log("!! 模型加载失败: %r" % (exc,))
         log(traceback.format_exc())
-        _abort("模型加载失败:\n%r\n\n详见日志: %s" % (exc, log.path))
+        _abort("模型加载失败:\n%r" % (exc,))
         return
     log("模型加载完成。")
 
@@ -488,6 +632,7 @@ def main():
         'preview': None,
         'boxes': [],
         'frames': 0,
+        'locked': False,
         'error': '',
     }
     lock = threading.Lock()
@@ -497,6 +642,9 @@ def main():
         log("监视线程启动: 监控区域=%s 截图区域=%s 阈值=%.2f 冷却=%.0fs"
             % (mon_roi, shot_roi, CONF_THRESHOLD, COOLDOWN))
         grab_fail = 0
+        lock_fail_streak = 0    # 连续抓屏失败次数(锁屏判定要连续失败, 避免误报)
+        ok_streak = 0           # 连续抓屏成功次数(解锁判定也要连续成功)
+        lock_reported = False
         try:
             with mss() as sct:
                 while state['running']:
@@ -504,22 +652,58 @@ def main():
                         frame = cv2.cvtColor(np.array(sct.grab(mon_box)), cv2.COLOR_BGRA2BGR)
                     except Exception as exc:
                         grab_fail += 1
-                        if grab_fail <= 3:
+                        lock_fail_streak += 1
+                        ok_streak = 0
+                        now_locked, why = is_desktop_locked()
+                        # 滞后判断: 要连续 3 次失败(抓屏失败 + 桌面确实打不开)才算锁屏,
+                        # 因为切换桌面的一瞬间偶尔会有一次侥幸成功, 会误报"解锁"。
+                        if now_locked and lock_fail_streak >= 3:
+                            with lock:
+                                state['locked'] = True
+                            if not lock_reported:
+                                log("检测到屏幕已锁定(Win+L) -> 系统禁止抓屏, "
+                                    "锁定期间无法监视, 解锁后会自动继续 [%s]" % why)
+                                lock_reported = True
+                            with lock:
+                                state['error'] = "屏幕已锁定, 等待解锁..."
+                            # 自检模式: 锁屏时再抓一帧, 作为"锁定期间抓不到"的证据
+                            if (selftest_dir or locktest_dir) and not state.get('lock_probe_done'):
+                                try:
+                                    probe = cv2.cvtColor(np.array(sct.grab(mon_box)),
+                                                         cv2.COLOR_BGRA2BGR)
+                                    cv2.imwrite(os.path.join(debug_dir, 'debug_locked_frame.png'), probe)
+                                    log("锁定期间居然抓到画面? 已存到临时目录")
+                                except Exception as exc2:
+                                    log("锁定期间抓屏确认失败: %r" % (exc2,))
+                                state['lock_probe_done'] = True
+                            time.sleep(1.0)
+                            continue
+                        # 真正异常: 前面 3 次详细记录, 之后每 60 次记一次, 避免刷爆日志
+                        if grab_fail <= 3 or grab_fail % 60 == 0:
                             log("!! 抓取监控区域失败(%d): %r" % (grab_fail, exc))
                         with lock:
                             state['error'] = "抓取监控区域失败: %s" % exc
                         time.sleep(0.5)
                         continue
 
+                    # 抓屏成功
+                    lock_fail_streak = 0
+                    ok_streak += 1
+                    # 滞后判断: 要连续若干次成功才认定真的解锁了
+                    if lock_reported and ok_streak >= 3:
+                        log("屏幕已解锁, 恢复监视")
+                        lock_reported = False
+
                     with lock:
+                        state['locked'] = False
                         state['preview'] = frame
                         first_frame = state['frames'] == 0
                     # 自检模式把第一帧存下来, 方便确认屏幕上到底有什么
                     if selftest_dir and first_frame:
                         try:
-                            cv2.imwrite(os.path.join(save_dir, 'debug_first_frame.png'), frame)
-                            log("已保存首帧预览: debug_first_frame.png (%dx%d)"
-                                % (frame.shape[1], frame.shape[0]))
+                            cv2.imwrite(os.path.join(debug_dir, 'debug_first_frame.png'), frame)
+                            log("已保存首帧预览: %s"
+                                % os.path.join(debug_dir, 'debug_first_frame.png'))
                         except Exception as exc:
                             log("保存首帧失败: %r" % (exc,))
 
@@ -614,7 +798,12 @@ def main():
     cv2.moveWindow(win_name, 40, 40)
 
     blank = np.zeros((mon_roi[3], mon_roi[2], 3), np.uint8)
-    selftest_deadline = time.time() + 30 if selftest_dir else None
+    if locktest_dir:
+        selftest_deadline = time.time() + 120
+    elif selftest_dir:
+        selftest_deadline = time.time() + 30
+    else:
+        selftest_deadline = None
 
     while state['running']:
         with lock:
@@ -624,46 +813,57 @@ def main():
             last_name = state['last_name']
             err = state['error']
             found = list(state['boxes'])
+            locked = state['locked']
 
         disp = frame.copy() if frame is not None else blank.copy()
         if disp.shape[1] != mon_roi[2] or disp.shape[0] != mon_roi[3]:
             disp = cv2.resize(disp, (mon_roi[2], mon_roi[3]))
+        H, W = disp.shape[:2]
 
-        bar_h = 56 if disp.shape[0] > 120 else max(24, disp.shape[0] // 4)
-        overlay = disp.copy()
-        cv2.rectangle(overlay, (0, 0), (disp.shape[1], bar_h), (0, 0, 0), -1)
-        disp = cv2.addWeighted(overlay, 0.7, disp, 0.3, 0)
+        # 状态条: 单行紧凑设计, 只占 34px; 画面太矮时自动缩短或不显示
+        font_sz = max(13, min(24, int(W / 48)))
+        bar_h = min(BAR_H, int(H * 0.20))
+        if bar_h < 16:
+            bar_h = 0
+        if bar_h > 0:
+            overlay = disp.copy()
+            cv2.rectangle(overlay, (0, 0), (W, bar_h), (0, 0, 0), -1)
+            disp = cv2.addWeighted(overlay, 0.55, disp, 0.45, 0)
 
-        scale = max(0.45, min(0.9, disp.shape[1] / 700.0))
+        scale = max(0.45, min(0.9, W / 700.0))
         thick = max(1, int(round(scale * 2)))
 
         # 检测框(画在提示条下方, 方便肉眼确认"到底有没有检测到人")
         if found and mon_roi[2]:
-            sc = disp.shape[1] / float(mon_roi[2])
-            sh_ = disp.shape[0] / float(mon_roi[3]) if mon_roi[3] else sc
+            sc = W / float(mon_roi[2])
+            sh_ = H / float(mon_roi[3]) if mon_roi[3] else sc
             for (bx1, by1, bx2, by2, cf) in found:
                 p1 = (int(bx1 * sc), int(by1 * sh_) + bar_h)
                 p2 = (int(bx2 * sc), int(by2 * sh_) + bar_h)
                 cv2.rectangle(disp, p1, p2, (0, 255, 255), thick)
-                cv2.putText(disp, "%.2f" % cf, (p1[0], max(bar_h + 14, p1[1] - 4)),
-                            cv2.FONT_HERSHEY_SIMPLEX, scale * 0.6, (0, 255, 255), 1)
+                draw_text(disp, "人 %.0f%%" % (cf * 100.0),
+                          (p1[0], max(bar_h + 2, p1[1] - int(font_sz * 1.2))),
+                          size=max(12, int(font_sz * 0.7)), color=(0, 255, 255))
 
-        if disp.shape[0] > 60:
-            if person:
-                line, color = "PERSON DETECTED - saving!", (0, 0, 255)
-            else:
-                line, color = "monitoring... shots: %d" % shots, (0, 255, 0)
-            cv2.putText(disp, line, (12, int(bar_h * 0.68)),
-                        cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick)
-            if last_name and not person:
-                cv2.putText(disp, "last: %s" % last_name[:24],
-                            (12, int(bar_h * 0.68) + int(bar_h * 0.5)),
-                            cv2.FONT_HERSHEY_SIMPLEX, scale * 0.6, (200, 200, 200), 1)
-            if err:
-                cv2.putText(disp, err[:60], (12, disp.shape[0] - 12),
-                            cv2.FONT_HERSHEY_SIMPLEX, scale * 0.6, (0, 165, 255), 1)
+        # 状态文字: 中文单行, 尽量少遮挡画面
+        if locked:
+            line, color = "已锁定 · 暂停监视", (0, 200, 255)
+        elif person:
+            line, color = "检测到人 · 正在截图", (0, 0, 255)
+        elif bar_h > 0:
+            line, color = "监视中 · 已存 %d 张" % shots, (0, 255, 0)
+        else:
+            line = None
 
-        cv2.rectangle(disp, (1, 1), (disp.shape[1] - 2, disp.shape[0] - 2), (0, 0, 255), thick)
+        if bar_h > 0 and line:
+            draw_text(disp, line, (6, max(1, (bar_h - font_sz) // 2)),
+                      size=font_sz, color=color, bold=True)
+
+        if err:
+            draw_text(disp, err[:40], (6, H - font_sz - 6),
+                      size=max(12, int(font_sz * 0.7)), color=(0, 165, 255))
+
+        cv2.rectangle(disp, (1, 1), (W - 2, H - 2), (0, 0, 255), thick)
         cv2.imshow(win_name, disp)
 
         key = cv2.waitKey(30) & 0xFF
