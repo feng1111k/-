@@ -3,21 +3,27 @@
 屏幕人物监视截图工具  (OpenCV / 控制台版)
 
 完整流程:
-  1. 启动后先选择截图保存文件夹
-  2. 在屏幕上拖拽框选【截图区域】  -> 有人经过时要保存下来的那块区域
-  3. 在屏幕上拖拽框选【监控区域】  -> 用来检测有没有人
-  4. 后台持续检测监控区域, 一旦出现人, 就抓取【截图区域】并按时间戳保存
-  5. 预览窗实时显示监控区域, 按 Q 或 Esc 退出
+  1. 启动后先选择保存文件夹
+  2. 选择工作模式: 截图 或 录屏
+  3. 在屏幕上拖拽框选【截图区域】/【录制区域】 -> 有人出现时要保存下来的那块区域
+  4. 在屏幕上拖拽框选【监控区域】 -> 用来检测有没有人
+  5. 后台持续检测监控区域:
+       截图模式: 出现人 -> 抓取截图区域, 存一张 PNG (冷却 COOLDOWN 秒)
+       录屏模式: 出现人 -> 开始录制录制区域; 连续 RECORD_STOP_DELAY 秒没人 -> 停止并保存 MP4
+  6. 预览窗实时显示监控区域, 按 Q 或 Esc 退出
 
 关键点:
-  - 两个区域分开选择, 检测用监控区域, 保存用截图区域
+  - 两个区域分开选择, 检测用监控区域, 保存/录制用截图(录制)区域
   - 全屏覆盖层用 tkinter 实现, 坐标 = 物理像素, 与 mss 抓屏坐标 1:1 对应
+  - 录屏在独立线程里按固定帧率抓屏, 不受 YOLO 推理速度影响
 
 命令行:
   python main_opencv.py                        正常使用
   python main_opencv.py --probe-dpi            只打印 DPI/屏幕信息, 不启动界面
   python main_opencv.py --test-detect <图片>    对一张图片跑一次检测, 打印原始结果
+  python main_opencv.py --rectest <目录> [秒]   只测录屏链路(全屏录制几秒并读回校验)
   python main_opencv.py --selftest <保存目录>   跳过框选, 直接监视全屏 30 秒
+  python main_opencv.py --mode shot|record     跳过模式选择(配合自检或自动化用)
 """
 
 import os
@@ -25,6 +31,42 @@ import sys
 import time
 import threading
 import traceback
+
+
+# ---------------------------------------------------------------- 无控制台输出
+# 打包成 exe 后没有 cmd 窗口, stdout/stderr 会是 None, 所有 print/log 都会丢。
+# 这里把输出重定向到临时目录的日志文件, 方便出问题时排查。
+# 注意: 日志只写 %TEMP%\ScreenPersonMonitor\, 不会污染保存文件夹。
+_FROZEN_LOG = None
+
+
+def _temp_log_dir():
+    d = os.path.join(os.environ.get('TEMP', '.'), 'ScreenPersonMonitor')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _setup_frozen_io():
+    global _FROZEN_LOG
+    if not getattr(sys, 'frozen', False):
+        return
+    try:
+        path = os.path.join(_temp_log_dir(), 'ScreenPersonMonitor.log')
+        # 超过 2MB 就重开, 避免日志无限增长
+        if os.path.exists(path) and os.path.getsize(path) > 2 * 1024 * 1024:
+            os.remove(path)
+        fp = open(path, 'a', encoding='utf-8', buffering=1)
+        fp.write("\n===== %s =====\n" % time.strftime('%Y-%m-%d %H:%M:%S'))
+        _FROZEN_LOG = fp
+        if sys.stdout is None:
+            sys.stdout = fp
+        if sys.stderr is None:
+            sys.stderr = fp
+    except Exception:
+        _FROZEN_LOG = None
+
+
+_setup_frozen_io()
 
 
 # ---------------------------------------------------------------- DPI 感知
@@ -114,12 +156,17 @@ os.environ.setdefault('YOLO_VERBOSE', 'false')
 import cv2
 import numpy as np
 from mss import mss
-from ultralytics import YOLO
 
 # ---------------- 可调参数 ----------------
 CONF_THRESHOLD = 0.45   # person 置信度阈值
 COOLDOWN = 5.0          # 两次截图最小间隔(秒)
 MIN_SIDE = 20           # 区域最小边长
+
+RECORD_FPS = 20         # 录屏帧率
+RECORD_STOP_DELAY = 2.0 # 录屏模式: 连续这么多秒没检测到人就停止录制
+
+MODE_SHOT = 'shot'      # 截图模式
+MODE_RECORD = 'record'  # 录屏模式
 
 # 预览窗状态条最大高度 (像素)。单行紧凑设计, 尽量少遮挡监控画面。
 BAR_H = 34
@@ -277,8 +324,9 @@ MODEL_PATH = resource_path('yolov8n.pt')
 # ---------------------------------------------------------------- 日志
 class Log:
     """
-    只往控制台输出, 不写任何文件。
-    打包成 exe(无控制台)时这些输出自动丢弃, 不会在保存目录里留文件。
+    输出到控制台; 打包成 exe(无控制台)时 _setup_frozen_io() 已把 stdout
+    重定向到 %TEMP%\\ScreenPersonMonitor\\ScreenPersonMonitor.log。
+    不会在保存目录里留任何日志文件。
     """
 
     def __call__(self, msg):
@@ -289,6 +337,56 @@ class Log:
 
 
 log = Log()
+
+
+# ---------------------------------------------------------------- 崩溃处理
+def _report_crash(exc_type, exc, tb, source='主线程'):
+    """打包后没有控制台: 未捕获异常时写日志并弹窗, 不让程序默默消失。"""
+    try:
+        text = ''.join(traceback.format_exception(exc_type, exc, tb))
+    except Exception:
+        text = repr(exc)
+    path = ''
+    try:
+        path = os.path.join(_temp_log_dir(),
+                            time.strftime('crash_%Y%m%d_%H%M%S.log'))
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+    except Exception:
+        path = ''
+    try:
+        log("!! %s 未捕获异常: %r" % (source, exc))
+        log(text)
+    except Exception:
+        pass
+    try:
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        messagebox.showerror(
+            "ScreenPersonMonitor 遇到错误",
+            "程序遇到未处理的错误, 已停止运行。\n\n%r\n\n详细信息:\n%s"
+            % (exc, path or '(临时目录不可写, 请从源码运行查看错误)'))
+        root.destroy()
+    except Exception:
+        pass
+
+
+def _install_crash_handler():
+    def hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            return
+        _report_crash(exc_type, exc, tb)
+
+    sys.excepthook = hook
+
+    def thread_hook(args):
+        if args.exc_type is SystemExit:
+            return
+        _report_crash(args.exc_type, args.exc_value, args.exc_traceback, '后台线程')
+
+    threading.excepthook = thread_hook
 
 # 屏幕尺寸只取一次, 避免反复创建/销毁 tkinter 根窗口
 _SCREEN = {}
@@ -329,6 +427,274 @@ def screen_info():
     }
 
 
+# ---------------------------------------------------------------- 录屏
+class ScreenRecorder:
+    """
+    在独立线程里按固定帧率录制指定屏幕区域。
+
+    - 检测线程/主线程只调用 request_start()/request_stop() 改标志,
+      真正打开和关闭 VideoWriter 都在录制线程里做, 避免跨线程操作 cv2 对象。
+    - 录屏线程和检测线程各用一个 mss 实例 (mss 对象不是线程安全的)。
+    - 编码优先 mp4v + .mp4, 失败自动退 MJPG/XVID + .avi。
+    """
+
+    CODECS = (('mp4v', '.mp4'), ('MJPG', '.avi'), ('XVID', '.avi'))
+
+    def __init__(self, box, out_dir, fps=RECORD_FPS):
+        # 宽高取偶数, 部分编码器遇到奇数尺寸会失败或写出坏文件
+        self.box = {
+            'left': int(box['left']),
+            'top': int(box['top']),
+            'width': max(2, int(box['width']) // 2 * 2),
+            'height': max(2, int(box['height']) // 2 * 2),
+        }
+        self.out_dir = out_dir
+        self.fps = max(1, int(round(fps)))
+
+        self._lock = threading.Lock()
+        self._want = False       # 检测线程要求录制
+        self._active = False     # VideoWriter 已打开
+        self._running = True
+        self._writer = None
+        self._path = ''
+        self._codec = ''
+        self._frames = 0
+        self._started_at = 0.0
+        self._segments = 0
+        self._last_path = ''
+        self._last_seconds = 0.0
+        self._last_frames = 0
+        self._error = ''
+        self._last_error_msg = ''
+        self._last_error_log = 0.0
+
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    # ---------------- 检测线程 / 主线程调用 ----------------
+    def request_start(self):
+        with self._lock:
+            self._want = True
+
+    def request_stop(self):
+        with self._lock:
+            self._want = False
+
+    def is_recording(self):
+        """True = 正在录制, 或已请求开始但文件还没打开"""
+        with self._lock:
+            return self._want or self._active
+
+    def snapshot(self):
+        """给界面用的状态快照 (加锁, 不会和录制线程抢对象)"""
+        with self._lock:
+            return {
+                'active': self._active,
+                'path': self._path,
+                'codec': self._codec,
+                'frame': self._frames,
+                'seconds': (time.time() - self._started_at) if self._active else 0.0,
+                'segments': self._segments,
+                'last_path': self._last_path,
+                'last_seconds': self._last_seconds,
+                'last_frames': self._last_frames,
+                'error': self._error,
+            }
+
+    def close(self):
+        """退出程序前调用: 停止录制, 把最后一段写完"""
+        with self._lock:
+            self._running = False
+            self._want = False
+        self._thread.join(timeout=5.0)
+        self._close_writer()    # 兜底: 线程没来得及关时由主线程关
+
+    # ---------------- 录制线程 ----------------
+    def _loop(self):
+        try:
+            with mss() as sct:
+                next_t = time.time()
+                while self._running:
+                    with self._lock:
+                        want = self._want
+                    if not self._running:
+                        break
+                    if not want:
+                        self._close_writer()
+                        time.sleep(0.03)
+                        next_t = time.time()
+                        continue
+
+                    if not self._active:
+                        try:
+                            raw = sct.grab(self.box)
+                        except Exception as exc:
+                            self._fail("抓取录制区域失败: %r" % (exc,))
+                            time.sleep(0.2)
+                            continue
+                        frame = np.ascontiguousarray(np.array(raw)[:, :, :3])
+                        if not self._open_writer(frame.shape[1], frame.shape[0]):
+                            time.sleep(0.5)
+                            continue
+                        self._write(frame)
+                        next_t = time.time() + 1.0 / self.fps
+                        continue
+
+                    now = time.time()
+                    if next_t > now:
+                        time.sleep(min(next_t - now, 0.05))
+                        continue
+                    try:
+                        raw = sct.grab(self.box)
+                    except Exception as exc:
+                        self._fail("抓取录制区域失败: %r" % (exc,))
+                        next_t = time.time()
+                        time.sleep(0.1)
+                        continue
+                    frame = np.ascontiguousarray(np.array(raw)[:, :, :3])
+                    self._write(frame)
+                    next_t += 1.0 / self.fps
+                    # 编码跟不上时不要疯狂补帧, 直接对齐时间轴 (相当于丢帧)
+                    if next_t < time.time() - 1.0:
+                        next_t = time.time()
+        except Exception as exc:
+            self._fail("录屏线程崩溃: %r" % (exc,))
+            log(traceback.format_exc())
+        finally:
+            self._close_writer()
+            with self._lock:
+                self._running = False
+
+    # ---------------- 内部 ----------------
+    def _new_path(self, ext):
+        base = time.strftime("record_%Y%m%d_%H%M%S")
+        path = os.path.join(self.out_dir, base + ext)
+        n = 1
+        while os.path.exists(path):
+            n += 1
+            path = os.path.join(self.out_dir, "%s_%d%s" % (base, n, ext))
+        return path
+
+    def _open_writer(self, w, h):
+        for codec, ext in self.CODECS:
+            path = self._new_path(ext)
+            writer = None
+            try:
+                writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*codec),
+                                         self.fps, (w, h))
+                if writer.isOpened():
+                    with self._lock:
+                        self._writer = writer
+                        self._path = path
+                        self._codec = codec
+                        self._frames = 0
+                        self._started_at = time.time()
+                        self._active = True
+                        self._error = ''
+                    log("开始录屏: %s (%dx%d @ %d fps, %s)"
+                        % (path, w, h, self.fps, codec))
+                    return True
+            except Exception as exc:
+                log("!! 打开编码器 %s 失败: %r" % (codec, exc))
+            if writer is not None:
+                writer.release()
+        self._fail("没有可用的视频编码器 (mp4v/MJPG/XVID 都失败)")
+        return False
+
+    def _write(self, frame):
+        writer = self._writer
+        if writer is None:
+            return
+        try:
+            writer.write(frame)
+            with self._lock:
+                self._frames += 1
+        except Exception as exc:
+            self._fail("写入视频失败: %r" % (exc,))
+
+    def _close_writer(self):
+        with self._lock:
+            writer = self._writer
+            if not self._active:
+                return
+            path = self._path
+            frames = self._frames
+            seconds = time.time() - self._started_at
+            self._writer = None
+            self._active = False
+            self._segments += 1
+            self._last_path = path
+            self._last_frames = frames
+            self._last_seconds = seconds
+        try:
+            writer.release()
+        except Exception:
+            pass
+        log("录屏已保存: %s (%.1f 秒, %d 帧)" % (path, seconds, frames))
+
+    def _fail(self, msg):
+        with self._lock:
+            self._error = msg
+        now = time.time()
+        # 同一个错误最多每 5 秒记一次, 避免锁屏/抓屏失败时刷爆控制台
+        if msg != self._last_error_msg or now - self._last_error_log >= 5.0:
+            self._last_error_msg = msg
+            self._last_error_log = now
+            log("!! %s" % msg)
+
+
+def _run_record_test(argv):
+    """诊断: 不加载模型、不弹框, 直接录制整个屏幕 N 秒并校验文件能否读回"""
+    i = argv.index('--rectest')
+    out_dir = (argv[i + 1] if len(argv) > i + 1
+               else os.path.join(os.environ.get('TEMP', '.'), 'spm_rectest'))
+    seconds = 4.0
+    if len(argv) > i + 2:
+        try:
+            seconds = max(1.0, float(argv[i + 2]))
+        except ValueError:
+            pass
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        out_dir = os.path.join(os.environ.get('TEMP', '.'), 'spm_rectest')
+        os.makedirs(out_dir, exist_ok=True)
+
+    with mss() as sct:
+        m = sct.monitors[0]
+        box = {'left': m['left'], 'top': m['top'],
+               'width': m['width'], 'height': m['height']}
+    print("=== 录屏链路测试: 全屏 %dx%d, 录 %.1f 秒, 输出目录 %s ==="
+          % (box['width'], box['height'], seconds, out_dir))
+    rec = ScreenRecorder(box, out_dir, RECORD_FPS)
+    rec.request_start()
+    time.sleep(seconds)
+    rec.request_stop()
+    deadline = time.time() + 5.0
+    while rec.is_recording() and time.time() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.2)
+    rec.close()
+
+    snap = rec.snapshot()
+    path = snap['last_path']
+    print("RECTEST path=%s segments=%d frames=%d seconds=%.2f codec=%s error=%s"
+          % (path, snap['segments'], snap['last_frames'], snap['last_seconds'],
+             snap['codec'], snap['error']))
+    if not path or not os.path.exists(path):
+        print("RECTEST FAIL: 没有生成视频文件")
+        return
+    cap = cv2.VideoCapture(path)
+    ok, frame = cap.read()
+    size = "%dx%d" % (frame.shape[1], frame.shape[0]) if ok else "-"
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
+    print("RECTEST read_ok=%s size=%s fps=%.1f frames=%.0f file=%.1f KB"
+          % (ok, size, fps, total, os.path.getsize(path) / 1024.0))
+    print("RECTEST %s" % ("OK" if ok else "FAIL: 视频读不回来"))
+
+
 # ---------------------------------------------------------------- 第 1 步
 def choose_save_dir():
     default_dir = os.path.join(app_dir(), 'screenshots')
@@ -340,7 +706,7 @@ def choose_save_dir():
         from tkinter import filedialog
         chosen = filedialog.askdirectory(
             parent=root,
-            title="第 1 步 / 共 3 步: 选择截图保存文件夹 (取消 = 用默认 screenshots)"
+            title="第 1 步 / 共 4 步: 选择保存文件夹 (截图/录屏都存这里; 取消 = 默认 screenshots)"
         )
     finally:
         root.destroy()
@@ -369,7 +735,7 @@ def choose_save_dir():
     sys.exit(1)
 
 
-# ---------------------------------------------------------------- 第 2/3 步
+# ---------------------------------------------------------------- 界面工具
 def _pick_font(win, size, weight='bold'):
     try:
         from tkinter import font as tkfont
@@ -382,6 +748,87 @@ def _pick_font(win, size, weight='bold'):
     return ('Segoe UI', size, weight)
 
 
+# ---------------------------------------------------------------- 第 2 步
+def choose_mode():
+    """
+    选择工作模式。返回 MODE_SHOT / MODE_RECORD; 直接关窗或按 Esc 返回 None。
+    """
+    root = tk.Tk()
+    root.title("第 2 步 / 共 4 步: 选择工作模式")
+    root.attributes('-topmost', True)
+    root.resizable(False, False)
+    root.configure(bg='#1e1e1e')
+    root.geometry("560x420")
+
+    font_title = _pick_font(root, 17)
+    font_sub = _pick_font(root, 10, 'normal')
+    font_btn = _pick_font(root, 14)
+    font_desc = _pick_font(root, 9, 'normal')
+
+    result = {'mode': None}
+
+    def pick(mode):
+        result['mode'] = mode
+        root.destroy()
+
+    tk.Label(root, text="选择工作模式", bg='#1e1e1e', fg='#7289da',
+             font=font_title).pack(pady=(18, 4))
+    tk.Label(root, text="第 2 步 / 共 4 步 · 保存位置已选好, 接下来选截图还是录屏",
+             bg='#1e1e1e', fg='#aaaaaa', font=font_sub).pack()
+
+    wrap = tk.Frame(root, bg='#1e1e1e')
+    wrap.pack(expand=True, fill='both', padx=22, pady=12)
+    wrap.columnconfigure(0, weight=1)
+    wrap.columnconfigure(1, weight=1)
+    wrap.rowconfigure(0, weight=1)
+
+    def make_card(column, title, color, lines, mode):
+        card = tk.Frame(wrap, bg='#2a2a2a', bd=0, highlightthickness=1,
+                        highlightbackground='#3a3a3a')
+        card.grid(row=0, column=column, sticky='nsew', padx=8, pady=4)
+        tk.Button(card, text=title, command=lambda: pick(mode),
+                  bg=color, fg='white', activebackground=color,
+                  relief='flat', cursor='hand2', font=font_btn, height=2
+                  ).pack(fill='x', padx=12, pady=(14, 8))
+        for text in lines:
+            tk.Label(card, text=text, bg='#2a2a2a', fg='#cccccc',
+                     font=font_desc, justify='left', anchor='w'
+                     ).pack(fill='x', padx=14, pady=1)
+        tk.Frame(card, bg='#2a2a2a', height=10).pack()
+
+    make_card(0, "截图模式", '#3b6fd4',
+              ["监控区域出现人", "→ 保存一张 PNG 截图", "和原来的用法完全一样"], MODE_SHOT)
+    make_card(1, "录屏模式", '#c0392b',
+              ["监控区域出现人", "→ 开始录制 MP4",
+               "→ 连续 %.0f 秒没人自动停止" % RECORD_STOP_DELAY], MODE_RECORD)
+
+    tk.Label(root, text="选完模式后, 下一步拖拽框选区域; 按 Esc 可取消",
+             bg='#1e1e1e', fg='#888888', font=font_sub).pack(pady=(0, 14))
+
+    root.protocol('WM_DELETE_WINDOW', root.destroy)
+    root.bind('<Escape>', lambda e: root.destroy())
+    root.update_idletasks()
+    w, h = root.winfo_width(), root.winfo_height()
+    x = max(0, (root.winfo_screenwidth() - w) // 2)
+    y = max(0, (root.winfo_screenheight() - h) // 2)
+    root.geometry("+%d+%d" % (x, y))
+    root.mainloop()
+    return result['mode']
+
+
+def _parse_mode(argv):
+    """命令行 --mode shot|record, 用于跳过模式选择 (自检/自动化)"""
+    if '--mode' in argv:
+        i = argv.index('--mode')
+        val = argv[i + 1].strip().lower() if len(argv) > i + 1 else ''
+        if val in ('record', 'rec', 'video', '录屏'):
+            return MODE_RECORD
+        if val in ('shot', 'screenshot', 'image', '截图'):
+            return MODE_SHOT
+    return None
+
+
+# ---------------------------------------------------------------- 第 3/4 步
 def select_region(step, title, hint):
     """
     全屏半透明覆盖层, 拖拽框选一个矩形。
@@ -487,6 +934,11 @@ def main():
     argv = sys.argv[1:]
     selftest_dir = None
 
+    # 录屏链路自测: 不加载模型、不弹框, 直接录全屏几秒并读回校验
+    if '--rectest' in argv:
+        _run_record_test(argv)
+        return
+
     if '--probe-dpi' in argv:
         info = screen_info()
         print("DPI 设置 : %s" % info['dpi_msg'])
@@ -517,6 +969,7 @@ def main():
         img = cv2.imread(path)
         print("图片         : %s -> %s" % (path, None if img is None else img.shape))
         if img is not None:
+            from ultralytics import YOLO
             m = YOLO(MODEL_PATH)
             raw = m.predict(source=img, conf=0.01, device='cpu', verbose=False)[0]
             items = sorted(((float(b.conf[0]), int(b.cls[0])) for b in raw.boxes), reverse=True)
@@ -536,6 +989,8 @@ def main():
         i = argv.index('--selftest')
         selftest_dir = argv[i + 1] if len(argv) > i + 1 else os.path.join(app_dir(), 'screenshots')
 
+    cli_mode = _parse_mode(argv)
+
     if locktest_dir:
         # 锁屏测试: 监视全屏 120 秒, 期间用户可以按 Win+L 锁屏再解锁
         save_dir = locktest_dir
@@ -552,6 +1007,7 @@ def main():
             m = sct.monitors[0]
             shot_roi = (m['left'], m['top'], m['width'], m['height'])
         mon_roi = shot_roi
+        mode = cli_mode or MODE_SHOT
     elif selftest_dir:
         save_dir = selftest_dir
         try:
@@ -567,6 +1023,7 @@ def main():
             m = sct.monitors[0]
             shot_roi = (m['left'], m['top'], m['width'], m['height'])
         mon_roi = shot_roi
+        mode = cli_mode or MODE_SHOT
     else:
         # ---- 步骤 1: 保存文件夹 ----
         save_dir = choose_save_dir()
@@ -575,7 +1032,7 @@ def main():
         log("DPI: %s" % info['dpi_msg'])
         log("屏幕: tkinter=%s  mss=%s  scaling=%s"
             % (info['tk_screen'], info['mss_screen'], info.get('tk_scaling')))
-        log("截图保存目录: %s" % save_dir)
+        log("保存目录: %s" % save_dir)
         if not _DPI_OK:
             log("!! 警告: DPI 感知设置失败, 125%/150% 缩放下框选坐标可能偏移")
         tk_screen, mss_screen = info.get('tk_screen'), info.get('mss_screen')
@@ -583,18 +1040,37 @@ def main():
             log("!! 警告: tkinter 屏幕 %s 与抓屏尺寸 %s 不一致, 框选坐标会偏移!"
                 % (tk_screen, mss_screen))
 
-        # ---- 步骤 2: 截图区域 ----
-        shot_roi = select_region(
-            "第 2 步 / 共 3 步", "框选【截图区域】",
-            "按住鼠标左键拖拽框选要保存下来的画面 | 右键重画 | 回车确认 | Esc 取消")
-        if shot_roi is None:
-            _abort("已取消选择【截图区域】, 程序退出。")
-        log("截图区域 (left,top,w,h) = %s" % (shot_roi,))
+        # ---- 步骤 2: 工作模式 ----
+        mode = cli_mode or choose_mode()
+        if mode is None:
+            _abort("已取消选择工作模式, 程序退出。")
+        log("工作模式: %s" % ("录屏" if mode == MODE_RECORD else "截图"))
 
-        # ---- 步骤 3: 监控区域 ----
-        mon_roi = select_region(
-            "第 3 步 / 共 3 步", "框选【监控区域】",
-            "按住鼠标左键拖拽框选要监视的位置(有人经过就触发截图) | 右键重画 | 回车确认 | Esc 取消")
+        # ---- 步骤 3: 截图区域 / 录屏区域 ----
+        if mode == MODE_RECORD:
+            shot_roi = select_region(
+                "第 3 步 / 共 4 步", "框选【录屏区域】",
+                "按住鼠标左键拖拽框选要录制下来的画面 | 右键重画 | 回车确认 | Esc 取消")
+            if shot_roi is None:
+                _abort("已取消选择【录屏区域】, 程序退出。")
+            log("录屏区域 (left,top,w,h) = %s" % (shot_roi,))
+        else:
+            shot_roi = select_region(
+                "第 3 步 / 共 4 步", "框选【截图区域】",
+                "按住鼠标左键拖拽框选要保存下来的画面 | 右键重画 | 回车确认 | Esc 取消")
+            if shot_roi is None:
+                _abort("已取消选择【截图区域】, 程序退出。")
+            log("截图区域 (left,top,w,h) = %s" % (shot_roi,))
+
+        # ---- 步骤 4: 监控区域 ----
+        if mode == MODE_RECORD:
+            mon_hint = ("按住鼠标左键拖拽框选要监视的位置"
+                        "(有人出现就开始录屏, 连续 %.0f 秒没人后停止)"
+                        " | 右键重画 | 回车确认 | Esc 取消" % RECORD_STOP_DELAY)
+        else:
+            mon_hint = ("按住鼠标左键拖拽框选要监视的位置(有人经过就触发截图)"
+                        " | 右键重画 | 回车确认 | Esc 取消")
+        mon_roi = select_region("第 4 步 / 共 4 步", "框选【监控区域】", mon_hint)
         if mon_roi is None:
             _abort("已取消选择【监控区域】, 程序退出。")
         log("监控区域 (left,top,w,h) = %s" % (mon_roi,))
@@ -610,6 +1086,7 @@ def main():
     log("正在加载 YOLO 模型: %s" % MODEL_PATH)
     log("模型文件存在: %s" % os.path.exists(MODEL_PATH))
     try:
+        from ultralytics import YOLO
         model = YOLO(MODEL_PATH)
     except Exception as exc:
         log("!! 模型加载失败: %r" % (exc,))
@@ -623,8 +1100,18 @@ def main():
     shot_box = {"left": shot_roi[0], "top": shot_roi[1],
                 "width": shot_roi[2], "height": shot_roi[3]}
 
+    # ---- 录屏器 (只有录屏模式才创建) ----
+    recorder = None
+    if mode == MODE_RECORD:
+        recorder = ScreenRecorder(shot_box, save_dir, RECORD_FPS)
+        log("录屏设置: 帧率 %d fps, 连续 %.1f 秒没人自动停止, 输出目录 %s"
+            % (RECORD_FPS, RECORD_STOP_DELAY, save_dir))
+    else:
+        log("截图设置: 冷却 %.0f 秒, 输出目录 %s" % (COOLDOWN, save_dir))
+
     state = {
         'running': True,
+        'mode': mode,
         'person': False,
         'shots': 0,
         'last_capture': 0.0,
@@ -639,12 +1126,18 @@ def main():
 
     # ---- 后台检测线程 ----
     def monitor_loop():
-        log("监视线程启动: 监控区域=%s 截图区域=%s 阈值=%.2f 冷却=%.0fs"
-            % (mon_roi, shot_roi, CONF_THRESHOLD, COOLDOWN))
+        if mode == MODE_RECORD:
+            log("监视线程启动: 监控区域=%s 录屏区域=%s 阈值=%.2f (有人开始录, 连续 %.1f 秒没人停)"
+                % (mon_roi, shot_roi, CONF_THRESHOLD, RECORD_STOP_DELAY))
+        else:
+            log("监视线程启动: 监控区域=%s 截图区域=%s 阈值=%.2f 冷却=%.0fs"
+                % (mon_roi, shot_roi, CONF_THRESHOLD, COOLDOWN))
         grab_fail = 0
         lock_fail_streak = 0    # 连续抓屏失败次数(锁屏判定要连续失败, 避免误报)
         ok_streak = 0           # 连续抓屏成功次数(解锁判定也要连续成功)
         lock_reported = False
+        last_person = 0.0       # 录屏模式: 最后一次检测到人的时间
+        stop_announced = False  # 避免"停止录屏"日志反复打印
         try:
             with mss() as sct:
                 while state['running']:
@@ -666,6 +1159,10 @@ def main():
                                 lock_reported = True
                             with lock:
                                 state['error'] = "屏幕已锁定, 等待解锁..."
+                            # 锁屏时抓不到画面, 正在录的也先停下来, 免得留下空文件
+                            if mode == MODE_RECORD and recorder.is_recording():
+                                recorder.request_stop()
+                                log("屏幕锁定 -> 停止录屏; 解锁后检测到人会重新开始")
                             # 自检模式: 锁屏时再抓一帧, 作为"锁定期间抓不到"的证据
                             if (selftest_dir or locktest_dir) and not state.get('lock_probe_done'):
                                 try:
@@ -734,16 +1231,34 @@ def main():
                         state['person'] = person
                         state['frames'] += 1
                         state['boxes'] = found
-                        if person and (now - state['last_capture']) >= COOLDOWN:
+                        if (mode == MODE_SHOT and person
+                                and (now - state['last_capture']) >= COOLDOWN):
                             state['last_capture'] = now
                             trigger = True
-                        # 自检模式: 每 3 秒报告一次最高置信度(不做阈值过滤),
-                        # 用来判断"是没检测到, 还是检测到了但没过阈值"
-                        if selftest_dir and now - state.get('last_report', 0) >= 3:
-                            state['last_report'] = now
-                            do_raw = True
-                        else:
-                            do_raw = False
+
+                    # 录屏模式: 监控区域出现人就开始录, 连续 RECORD_STOP_DELAY 秒没人就停
+                    if mode == MODE_RECORD:
+                        if person:
+                            last_person = now
+                            stop_announced = False
+                            if not recorder.is_recording():
+                                log("检测到人 (置信度 %.3f) -> 开始录屏" % best)
+                                recorder.request_start()
+                        elif (recorder.is_recording()
+                              and (now - last_person) >= RECORD_STOP_DELAY):
+                            if not stop_announced:
+                                log("已连续 %.0f 秒未检测到人 -> 停止录屏"
+                                    % RECORD_STOP_DELAY)
+                                stop_announced = True
+                            recorder.request_stop()
+
+                    # 自检模式: 每 3 秒报告一次最高置信度(不做阈值过滤),
+                    # 用来判断"是没检测到, 还是检测到了但没过阈值"
+                    if selftest_dir and now - state.get('last_report', 0) >= 3:
+                        state['last_report'] = now
+                        do_raw = True
+                    else:
+                        do_raw = False
 
                     if do_raw:
                         try:
@@ -791,7 +1306,8 @@ def main():
     threading.Thread(target=monitor_loop, daemon=True).start()
 
     # ---- 预览窗 (主线程) ----
-    win_name = "MONITORING - press Q or Esc to quit"
+    win_name = ("MONITORING [REC] - press Q or Esc to quit" if mode == MODE_RECORD
+                else "MONITORING - press Q or Esc to quit")
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win_name, max(240, min(mon_roi[2], 900)), max(160, min(mon_roi[3], 700)))
     cv2.setWindowProperty(win_name, cv2.WND_PROP_TOPMOST, 1)
@@ -814,6 +1330,8 @@ def main():
             err = state['error']
             found = list(state['boxes'])
             locked = state['locked']
+
+        rec = recorder.snapshot() if recorder is not None else None
 
         disp = frame.copy() if frame is not None else blank.copy()
         if disp.shape[1] != mon_roi[2] or disp.shape[0] != mon_roi[3]:
@@ -848,16 +1366,30 @@ def main():
         # 状态文字: 中文单行, 尽量少遮挡画面
         if locked:
             line, color = "已锁定 · 暂停监视", (0, 200, 255)
+        elif rec is not None and rec['active']:
+            line, color = ("录制中 · %.1f 秒 · 第 %d 段"
+                           % (rec['seconds'], rec['segments'] + 1)), (0, 0, 255)
+        elif mode == MODE_RECORD and person:
+            line, color = "检测到人 · 开始录制", (0, 0, 255)
+        elif mode == MODE_RECORD:
+            line, color = ("监视中 · 等待出现人 · 已录 %d 段"
+                           % (rec['segments'] if rec else 0)), (0, 255, 0)
         elif person:
             line, color = "检测到人 · 正在截图", (0, 0, 255)
-        elif bar_h > 0:
-            line, color = "监视中 · 已存 %d 张" % shots, (0, 255, 0)
         else:
-            line = None
+            line, color = "监视中 · 已存 %d 张" % shots, (0, 255, 0)
 
         if bar_h > 0 and line:
             draw_text(disp, line, (6, max(1, (bar_h - font_sz) // 2)),
                       size=font_sz, color=color, bold=True)
+
+        # 录屏时右上角亮一个红点, 一眼就能看出在录
+        if rec is not None and rec['active'] and bar_h >= 24:
+            r = max(4, bar_h // 5)
+            cv2.circle(disp, (W - r - 8, bar_h // 2), r, (0, 0, 255), -1)
+
+        if not err and rec is not None:
+            err = rec['error']
 
         if err:
             draw_text(disp, err[:40], (6, H - font_sz - 6),
@@ -883,11 +1415,19 @@ def main():
             break
 
     state['running'] = False
-    time.sleep(0.4)
+    if recorder is not None:
+        recorder.close()
+    time.sleep(0.2)
     cv2.destroyAllWindows()
     with lock:
         frames, shots = state['frames'], state['shots']
     log("已退出。共检测 %d 帧, 保存 %d 张截图到: %s" % (frames, shots, save_dir))
+    if recorder is not None:
+        snap = recorder.snapshot()
+        log("录屏结束: 共 %d 段, 最后一段 %s (%.1f 秒, %d 帧)"
+            % (snap['segments'], snap['last_path'] or '无',
+               snap['last_seconds'], snap['last_frames']))
+        print("RECORD segments=%d last=%s" % (snap['segments'], snap['last_path']))
     if selftest_dir:
         print("SELFTEST frames=%d shots=%d" % (frames, shots))
 
@@ -905,4 +1445,6 @@ def _abort(msg):
 
 
 if __name__ == '__main__':
+    if getattr(sys, 'frozen', False):
+        _install_crash_handler()
     main()
